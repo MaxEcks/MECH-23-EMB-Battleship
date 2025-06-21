@@ -369,7 +369,7 @@ void state_end(MessageBuffer* msg, GameState* game) {
         msg->ready = false;
     } else {
         for (uint8_t row = 0; row < 10; row++) {
-            LOG("DH_SF_%dD", row);
+            LOG("DH_SF%dD", row);
             for (uint8_t col = 0; col < 10; col++) {
                 LOG("%c", game->my_field[IDX(row, col)]);
             }
@@ -437,7 +437,7 @@ void handle_hd_boom_xy(GameState* game) {
         if (game->enemy_hits == 30) {
             game->i_lost = true;
             for (uint8_t row = 0; row < 10; row++) {
-                LOG("DH_SF_%dD", row);
+                LOG("DH_SF%dD", row);
                 for (uint8_t col = 0; col < 10; col++) {
                     LOG("%c", game->my_field[IDX(row, col)]);
                 }
