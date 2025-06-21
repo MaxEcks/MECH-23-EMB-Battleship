@@ -4,47 +4,34 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+
 // =========================================================================
-// LOG() macro instead of printf()
+
 #define LOG( msg... ) printf( msg );
 
-// Baudrate for USART communication
 #define BAUDRATE 115200
 
-// battlefield size
 #define FIELD_SIZE 100
 #define ROWS 10
 #define COLS 10
 #define CELL (x * 10 + y)
+
 // =========================================================================
-// For supporting printf function we override the _write function to redirect the output to UART
+
 int _write(int handle, char* data, int size) {
-  // 'handle' is typically ignored in this context, as we're redirecting all output to USART2
-  // 'data' is a pointer to the buffer containing the data to be sent
-  // 'size' is the number of bytes to send
+    int count = size;
 
-  int count = size;  // Make a copy of the size to use in the loop
+    while (count--) {
+        while (!(USART2->ISR & USART_ISR_TXE)) {
+        }
 
-  // Loop through each byte in the data buffer
-  while (count--) {
-      // Wait until the transmit data register (TDR) is empty,
-      // indicating that USART2 is ready to send a new byte
-      while (!(USART2->ISR & USART_ISR_TXE)) {
-          // Wait here (busy wait) until TXE (Transmit Data Register Empty) flag is set
-      }
-
-      // Load the next byte of data into the transmit data register (TDR)
-      // This sends the byte over UART
-      USART2->TDR = *data++;
-
-      // The pointer 'data' is incremented to point to the next byte to send
-  }
-
-  // Return the total number of bytes that were written
-  return size;
+        USART2->TDR = *data++;
+    }
+    
+    return size;
 }
+
 // =========================================================================
-// FIFO buffer implementation
 
 #define BUFFER_SIZE 64
 #define FIFO_ERROR -1
@@ -56,51 +43,50 @@ typedef struct {
 } Fifo_t;
 
 void fifo_init(Fifo_t* fifo) {
-    fifo->head = 0; // Initialize head pointer to 0
-    fifo->tail = 0; // Initialize tail pointer to 0
+    fifo->head = 0;
+    fifo->tail = 0;
 }
 
 uint8_t fifo_is_empty(Fifo_t* fifo) {
-    return (fifo->head == fifo->tail);  // FIFO is empty if head and tail are equal
+    return (fifo->head == fifo->tail);
 }
 
 uint8_t fifo_is_full(Fifo_t* fifo) {
-    return ((fifo->head + 1) % BUFFER_SIZE) == fifo->tail; // FIFO is full if incrementing head would equal tail
+    return ((fifo->head + 1) % BUFFER_SIZE) == fifo->tail;
 }
 
 int fifo_put(Fifo_t* fifo, uint8_t data) {
-    if (fifo_is_full(fifo)) {   // Check if FIFO is full before inserting
-        return FIFO_ERROR;      // Insertion failed (buffer full)
+    if (fifo_is_full(fifo)) {
+        return FIFO_ERROR;
     }
 
-    fifo->buffer[fifo->head] = data;            // Store data at current head position
-    fifo->head = (fifo->head + 1) % BUFFER_SIZE;  // Move head forward and wrap around if needed
-    return 0;                                   // Insertion successful
+    fifo->buffer[fifo->head] = data;
+    fifo->head = (fifo->head + 1) % BUFFER_SIZE;
+    return 0;
 }
 
 int fifo_get(Fifo_t* fifo, uint8_t* data) {
-    if (fifo_is_empty(fifo)) {  // Check if FIFO is empty before reading
-        return FIFO_ERROR;      // Read failed (buffer empty)
+    if (fifo_is_empty(fifo)) {
+        return FIFO_ERROR;
     }
 
-    *data = fifo->buffer[fifo->tail];           // Retrieve data at current tail position
-    fifo->tail = (fifo->tail + 1) % BUFFER_SIZE;  // Move tail forward and wrap around if needed
-    return 0;                                   // Read successful Return 0
+    *data = fifo->buffer[fifo->tail];
+    fifo->tail = (fifo->tail + 1) % BUFFER_SIZE;
+    return 0;
 }
+
 // =========================================================================
-// finite state machine
 
 void state_init(void);
 void state_play(void);
 void state_end(void);
 
-void initializeSM(void);
+void init_new_game(void);
 
 typedef enum {STATE_INIT, STATE_PLAY, STATE_END} State_Type;
 static void (*state_table[])(void)={state_init, state_play, state_end};
 static State_Type curr_state; /* The "current state" */
 
-// enemy attack ENUM:
 typedef enum {
     HIT,
     MISS,
@@ -114,6 +100,7 @@ typedef enum {
 volatile Fifo_t usart_rx_fifo;
 
 volatile bool new_msg_ready = false;    // Parser-flag, if a new msg is ready to be processed
+
 char msg_buffer[BUFFER_SIZE];           // global Array for the msg
 
 uint8_t my_field[100] = {
@@ -142,16 +129,13 @@ char my_shots[FIELD_SIZE];      // our fire
 const uint8_t USART2_TX_PIN = 2; // PA2 is used as USART2_TX
 const uint8_t USART2_RX_PIN = 3; // PA3 is used as USART2_RX
 // =========================================================================
-// Functionprototypes
-// eventuell void Funktionen umbauen auf int function(void){} für besseres Fehlerhandling
-// eventuell Funktionen noch anpassen --> nicht direkt auf globale Variablen schreiben, sondern über Zeiger!
 
 void fifo_parser(void);
 void calculate_checksum(void);
 AttackedCellType check_game_status(void);
 void attacking_opponent(void);
+
 // =========================================================================
-// main loop
 
 int main(void) {
 
@@ -189,7 +173,7 @@ int main(void) {
 
     fifo_init((Fifo_t *)&usart_rx_fifo);                       // Init the FIFO
 
-    initializeSM();
+    init_new_game();
 
     while (1) 
     {
@@ -327,7 +311,7 @@ void state_end(void){
 }
 
 
-void initializeSM(void)
+void init_new_game(void)
 {
     curr_state = STATE_INIT;
     // reset, gamefield, etc. ...
