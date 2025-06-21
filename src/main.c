@@ -1,21 +1,37 @@
+// =========================================================================
+// SECTION: Includes and Basic Type Definitions
+// =========================================================================
+
 #include <stm32f0xx.h>
 #include "clock_.h"
 #include <stdio.h>
-#include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 
+/* instead of #include <stdbool.h> */
+typedef enum {
+    false,
+    true
+} bool;
+
+// =========================================================================
+// SECTION: Global Defines, Constrants & Macros
 // =========================================================================
 
 #define LOG( msg... ) printf( msg );
+
+#define BUFFER_SIZE 64
+#define FIFO_ERROR -1
 
 #define BAUDRATE 115200
 
 #define FIELD_SIZE 100
 #define ROWS 10
 #define COLS 10
-#define CELL (x * 10 + y)
+#define IDX(x, y) ((x) * 10 + (y))
 
+// =========================================================================
+// SECTION: UART Output Redirection (for printf or LOG)
 // =========================================================================
 
 int _write(int handle, char* data, int size) {
@@ -32,9 +48,8 @@ int _write(int handle, char* data, int size) {
 }
 
 // =========================================================================
-
-#define BUFFER_SIZE 64
-#define FIFO_ERROR -1
+// SECTION: FIFO Setup
+// =========================================================================
 
 typedef struct {
     uint8_t buffer[BUFFER_SIZE];
@@ -76,6 +91,8 @@ int fifo_get(Fifo_t* fifo, uint8_t* data) {
 }
 
 // =========================================================================
+// SECTION: Game State Structure, Message Types & UART Buffer
+// =========================================================================
 
 volatile Fifo_t usart_rx_fifo;
 
@@ -87,6 +104,16 @@ typedef struct {
     bool ready;
 } MessageBuffer;
 
+typedef enum {
+    /* MSG_NONE, */
+    MSG_HD_START,
+    MSG_HD_CS,
+    MSG_HD_BOOM_XY,
+    MSG_HD_BOOM_RESULT,
+    MSG_HD_SF_ROW,
+    /* MSG_INVALID */
+} MessageType;
+
 typedef struct {
     char my_field[FIELD_SIZE];
     char enemy_field[FIELD_SIZE];
@@ -95,13 +122,19 @@ typedef struct {
     uint8_t my_checksum[ROWS];
     uint8_t enemy_checksum[ROWS];
     uint8_t enemy_hits;
-    int last_shot_x;
-    int last_shot_y;
-    int total_games_played;
-    int games_won;
-    int games_lost;
+    uint8_t last_shot_x;
+    uint8_t last_shot_y;
+    uint8_t total_games_played;
+    uint8_t games_won;
+    uint8_t games_lost;
+    uint8_t parser_x;
+    uint8_t parser_y;
+    uint8_t parser_row;
+    bool i_lost;
 } GameState;
 
+// =========================================================================
+// SECTION: State Machine Setup
 // =========================================================================
 
 void state_init(MessageBuffer* msg, GameState* game);
@@ -120,14 +153,27 @@ static StateFunction state_table[] = {
 static State_Type curr_state;
 
 // =========================================================================
+// SECTION: Function Prototypes
+// =========================================================================
 
+/* Parser */
 void fifo_parser(MessageBuffer* msg);
-int calculate_checksum(GameState* game);
-int attacking_opponent(GameState* game);
+MessageType message_parser(MessageBuffer* msg, GameState* game);
 
-typedef enum {HIT, MISS, LOST, ATTACK_ERROR} AttackedCellType;
+/* Message Handlers */
+void handle_hd_start(GameState* game);
+void handle_hd_cs(MessageBuffer* msg, GameState* game);
+void handle_hd_boom_xy(GameState* game);
+void handle_hd_boom_result(MessageBuffer* msg, GameState* game);
+void handle_hd_sf_row(MessageBuffer* msg, GameState* game);
 
-AttackedCellType check_game_status(MessageBuffer* msg, GameState* game);
+/* Game Logic */
+void create_my_field(GameState* game);
+void attacking_opponent(GameState* game);
+bool validate_enemy_cs(GameState* game);
+
+// =========================================================================
+// SECTION: Main()
 // =========================================================================
 
 int main(void) {
@@ -155,26 +201,11 @@ int main(void) {
     NVIC_EnableIRQ(USART2_IRQn);
 
     fifo_init((Fifo_t *)&usart_rx_fifo);
-
-    GameState game;
     MessageBuffer usart_msg;
 
+    GameState game;
+    
     init_new_game(&game);
-
-    // Initialize my_field with the desired values
-    const char my_field_init[FIELD_SIZE] = {
-    '2','2','0','0','0','0','0','2','2','0',
-    '0','0','0','0','0','0','0','0','0','0',
-    '0','0','0','4','4','4','4','0','2','0',
-    '3','0','0','0','0','0','0','0','2','0',
-    '3','0','3','3','3','0','0','0','0','0',
-    '3','0','0','0','0','0','0','0','0','0',
-    '0','0','5','5','5','5','5','0','3','0',
-    '0','0','0','0','0','0','0','0','3','0',
-    '0','0','0','0','0','2','2','0','3','0',
-    '4','4','4','4','0','0','0','0','0','0'
-    };
-    memcpy(game.my_field, my_field_init, FIELD_SIZE);
 
     while (1) {
         fifo_parser(&usart_msg);
@@ -185,18 +216,22 @@ int main(void) {
 }
 
 // =========================================================================
-
-void USART2_IRQHandler(void) {
-    static int ret;
-    if (USART2->ISR & USART_ISR_RXNE) {
-        uint8_t c = USART2->RDR;
-        ret = fifo_put((Fifo_t *)&usart_rx_fifo, c);
-    }
-}
+// SECTION: Interrupt Handler
 // =========================================================================
 
-void fifo_parser(MessageBuffer* msg)
-{
+void USART2_IRQHandler(void) {
+    if (USART2->ISR & USART_ISR_RXNE) {
+        uint8_t c = USART2->RDR;
+        fifo_put((Fifo_t *)&usart_rx_fifo, c);
+    }
+}
+
+// =========================================================================
+// SECTION: Parser
+// =========================================================================
+
+void fifo_parser(MessageBuffer* msg) 
+{    
     static char temp_msg_buffer[BUFFER_SIZE];
     static uint8_t index = 0;
     uint8_t byte;
@@ -221,187 +256,303 @@ void fifo_parser(MessageBuffer* msg)
     }
 }
 
-void state_init (MessageBuffer* msg, GameState* game){
-    // ----- Start-Messages -----
-    // Input:  HD_START
-    // Output: DH_START_MAX
-    if(msg->ready && strcmp(msg->buffer, "HD_START") == 0) {
-        LOG("DH_START_MAX\r\n");
-        //create_my_field();
-        calculate_checksum(game);
-        msg->ready = false;
-
-        curr_state = STATE_INIT; // kein State-Wechsel
+MessageType message_parser(MessageBuffer* msg, GameState* game) 
+{
+    /* HD_START */
+    if (strcmp(msg->buffer, "HD_START") == 0) {
+        return MSG_HD_START;
     }
-    // ----- Exchange Checksum -----
-    // Input:  HD_CS_{xxxxxxxxxx}
-    // Output: DH_CS_{xxxxxxxxxx}
-    else if(msg->ready && strncmp(msg->buffer, "HD_CS_", 6) == 0){
-        // safe enemy checksum
+
+    /* HD_CS_{xxxxxxxxxx} */
+    if (strncmp(msg->buffer, "HD_CS_", 6) == 0 && strlen(msg->buffer) == 16) {
+        /* saving enemy checksum */
         for (uint8_t i = 0; i < ROWS; i++) {
             game->enemy_checksum[i] = msg->buffer[i + 6] - '0';
         }
-        
-        LOG("DH_CS_");
-        for (int i = 0; i < 10; i++) {
-            LOG("%d", game->my_checksum[i]);
-        }
-        LOG("\r\n");
-        msg->ready = false;
-
-        curr_state = STATE_PLAY;
+        return MSG_HD_CS;
     }
+
+    /* HD_BOOM_{x}_{y} */
+    if (strncmp(msg->buffer, "HD_BOOM_", 8) == 0 && strlen(msg->buffer) == 11 &&
+        msg->buffer[8] >= '0' && msg->buffer[8] <= '9' &&
+        msg->buffer[10] >= '0' && msg->buffer[10] <= '9') {
+
+        game->parser_x = msg->buffer[8] - '0';
+        game->parser_y = msg->buffer[10] - '0';
+        return MSG_HD_BOOM_XY;
+    }
+
+    /* HD_BOOM_{H/M} */
+    if (strncmp(msg->buffer, "HD_BOOM_", 8) == 0 && strlen(msg->buffer) == 9 &&
+        (msg->buffer[8] == 'H' || msg->buffer[8] == 'M')) {
+        return MSG_HD_BOOM_RESULT;
+    }
+
+    if (strncmp(msg->buffer, "HD_SF_", 6) == 0 &&
+        msg->buffer[6] >= '0' && msg->buffer[6] <= '9' &&
+        msg->buffer[7] == 'D' && strlen(msg->buffer) == 18) {
+
+        game->parser_row = msg->buffer[6] - '0';
+        return MSG_HD_SF_ROW;
+    }
+
+    /* return MSG_INVALID; */
 }
 
-void state_play(MessageBuffer* msg, GameState* game){
-    // ----- Enemy lost the Game ----
-    // Input:  HD_SF_{row}D{xxxxxxxxxx} (10 times)
-    // Output: DH_SF_{row}D{xxxxxxxxxx} (10 times)
-    if(msg->ready && strncmp(msg->buffer, "HD_SF", 5) == 0 && msg->buffer[5] - '0' < ROWS){
-        // safe enemy field
-        uint8_t row = msg->buffer[5] - '0';
-        
-        // safe_enemy_field();  -> in Funktion auslagern
-        for (uint8_t col = 0; col < COLS; col++) {
-            game->enemy_field[row * 10 + col] = msg->buffer[7 + col];
-        }
+// =========================================================================
+// SECTION: FSM States
+// =========================================================================
 
-        msg->ready = false;
+void state_init (MessageBuffer* msg, GameState* game) {
+    if (!msg->ready) return;
+    
+    MessageType type = message_parser(msg, game);
 
-        if (row < 9) {
-            curr_state = STATE_PLAY;
-        } else {
-            // calculate_cs(enemy_field);   -> CS des gegnerischen Spielfelds bilden
-            // return_field(my_field);      -> Ausgabe meines Spielfelds per UART
-            curr_state = STATE_END;
-        }
-    }
-    // ----- Enemy attack -----
-    // INPUT:  HD_BOOM_{x}_{y}
-    // OUTPUT: DH_BOOM_H/M and DH_BOOM_{x}_{y} OR DH_SF_{row}D{xxxxxxxxxx} (10 times), if we lost the game 
-    else if(msg->ready && strncmp(msg->buffer, "HD_BOOM_", 8) == 0 && strlen(msg->buffer) == 11){
-        // check if we were HIT
-        AttackedCellType status = check_game_status(msg, game);
-        
-        switch (status)
-        {
-        case MISS:
-            LOG("DH_BOOM_M\r\n");
-            attacking_opponent(game);
-            curr_state = STATE_PLAY;
-            break;
-        
-        case HIT:
-            LOG("DH_BOOM_H\r\n");
-            attacking_opponent(game);
-            curr_state = STATE_PLAY;
+    switch (type) {
+        case MSG_HD_START:
+            handle_hd_start(game);   
             break;
 
-        case LOST:
-            // return_field(my_field);
-            curr_state = STATE_END;
+        case MSG_HD_CS:
+            handle_hd_cs(msg, game);
             break;
-        
-        case ATTACK_ERROR:
-            // Vielleicht späteres Error-Handling implementieren
-            break;
-        
+
         default:
             break;
+    }
+    
+    msg->ready = false;
+}
+
+void state_play(MessageBuffer* msg, GameState* game) {
+    if (!msg->ready) return;
+
+    MessageType type = message_parser(msg, game);
+
+    switch (type) {
+        case MSG_HD_BOOM_XY:
+            handle_hd_boom_xy(game);
+            break;
+
+        case MSG_HD_BOOM_RESULT:
+            handle_hd_boom_result(game, msg);
+            break;
+
+        case MSG_HD_SF_ROW:
+            handle_hd_sf_row(game, msg);
+            break;
+
+        default:
+            break;
+    }
+
+    msg->ready = false;
+}
+
+void state_end(MessageBuffer* msg, GameState* game) {
+    if (game->i_lost) {
+        if (!msg->ready) return;
+
+        MessageType type = message_parser(msg, game);
+
+        if (type == MSG_HD_SF_ROW) {
+            handle_hd_sf_row(game, msg);
+
+            if (game->parser_row == 9) {
+                bool valid = validate_enemy_cs(game);
+                game->total_games_played++;
+                init_new_game(game);
+                curr_state = STATE_INIT;
+            }
         }
 
         msg->ready = false;
-    }
-    // ----- Enemy Hit or Miss -----
-    // IN:  HD_BOOM_H or HD_BOOM_M
-    if(msg->ready && strncmp(msg->buffer, "HD_BOOM_", 8) == 0 && strlen(msg->buffer) == 9) {
-        // H oder M in my_shots schreiben
-        if(msg->buffer[8] == 'H') {
-            game->my_shots[game->last_shot_x * 10 + game->last_shot_y] = 'H';
-        } else {
-            game->my_shots[game->last_shot_x * 10 + game->last_shot_y] = 'M';
+    } else {
+        for (uint8_t row = 0; row < 10; row++) {
+            LOG("DH_SF_%dD", row);
+            for (uint8_t col = 0; col < 10; col++) {
+                LOG("%c", game->my_field[IDX(row, col)]);
+            }
+            LOG("\r\n");
         }
-        msg->ready = false;
 
-        curr_state = STATE_PLAY;
+        game->games_won++;
+        game->total_games_played++;
+
+        init_new_game(game);
+        curr_state = STATE_INIT;
     }
 }
 
-void state_end(MessageBuffer* msg, GameState* game){
-    return;
-    // curr_state = STATE_INIT;
-}
-
-
-void init_new_game(GameState* game)
-{
+void init_new_game(GameState* game) {
     memset(game->my_field, '0', FIELD_SIZE);
     memset(game->enemy_field, '0', FIELD_SIZE);
     memset(game->my_shots, '0', FIELD_SIZE);
     memset(game->enemy_shots, '0', FIELD_SIZE);
+
     memset(game->my_checksum, 0, ROWS);
     memset(game->enemy_checksum, 0, ROWS);
 
     game->enemy_hits = 0;
     game->last_shot_x = 0;
     game->last_shot_y = 0;
+    game->i_lost = false;
+}
 
+// =========================================================================
+// SECTION: Message Handlers
+// =========================================================================
+
+void handle_hd_start(GameState* game) {
+    LOG("DH_START_MAX\r\n");
+    create_my_field(game);
     curr_state = STATE_INIT;
 }
 
-int calculate_checksum(GameState* game)
-{
+void handle_hd_cs(MessageBuffer* msg, GameState* game) {
+    for (uint8_t i = 0; i < ROWS; i++) {
+        game->enemy_checksum[i] = msg->buffer[i + 6] - '0';
+    }
+    
+    LOG("DH_CS_");
+    for (int i = 0; i < 10; i++) {
+        LOG("%d", game->my_checksum[i]);
+    }
+    LOG("\r\n");
+    curr_state = STATE_PLAY;
+}
+
+void handle_hd_boom_xy(GameState* game) {
+    uint8_t x = game->parser_x;
+    uint8_t y = game->parser_y;
+    uint8_t index = IDX(x, y);
+
+    if (game->my_field[index] == '0') {
+        LOG("DH_BOOM_M\r\n");
+        game->enemy_shots[index] = 'M';
+    } else {
+        game->enemy_shots[index] = 'H';
+        game->enemy_hits++;
+        
+        if (game->enemy_hits == 30) {
+            game->i_lost = true;
+            for (uint8_t row = 0; row < 10; row++) {
+                LOG("DH_SF_%dD", row);
+                for (uint8_t col = 0; col < 10; col++) {
+                    LOG("%c", game->my_field[IDX(row, col)]);
+                }
+                LOG("\r\n");
+            }
+
+            curr_state = STATE_END;
+            return;
+        }
+
+        LOG("DH_BOOM_H\r\n");
+    }
+
+    attacking_opponent(game);
+    curr_state = STATE_PLAY;
+}
+
+void handle_hd_boom_result(MessageBuffer* msg, GameState* game) {
+    uint8_t x = game->last_shot_x;
+    uint8_t y = game->last_shot_y;
+    uint8_t index = IDX(x, y);
+
+    if(msg->buffer[8] == 'H') {
+        game->my_shots[index] = 'H';
+    } else if (msg->buffer[8] == 'M') {
+        game->my_shots[index] = 'M';
+    }
+
+    curr_state = STATE_PLAY;
+}
+
+void handle_hd_sf_row(MessageBuffer* msg, GameState* game) {
+    uint8_t row = game->parser_row;
+
+    for (uint8_t col = 0; col < COLS; col++) {
+        game->enemy_field[IDX(row, col)] = msg->buffer[7 + col];
+    }
+
+    if (row == 9) { 
+        game->i_lost = false;
+        curr_state = STATE_END;
+    } else {
+        curr_state = STATE_PLAY;
+    }
+}
+
+// =========================================================================
+// SECTION: Game Logic
+// =========================================================================
+
+void create_my_field(GameState* game) {
+    /* game field */
+    const char my_field_init[FIELD_SIZE] = {
+    '2','2','0','0','0','0','0','2','2','0',
+    '0','0','0','0','0','0','0','0','0','0',
+    '0','0','0','4','4','4','4','0','2','0',
+    '3','0','0','0','0','0','0','0','2','0',
+    '3','0','3','3','3','0','0','0','0','0',
+    '3','0','0','0','0','0','0','0','0','0',
+    '0','0','5','5','5','5','5','0','3','0',
+    '0','0','0','0','0','0','0','0','3','0',
+    '0','0','0','0','0','2','2','0','3','0',
+    '4','4','4','4','0','0','0','0','0','0'
+    };
+    memcpy(game->my_field, my_field_init, FIELD_SIZE);
+
+    /* checksum */
     for (uint8_t row = 0; row < ROWS; row++) {
         uint8_t cs = 0;
         for (uint8_t col = 0; col < COLS; col++) {
-            uint8_t val = game->my_field[row * COLS + col]-'0';
+            uint8_t val = game->my_field[row * COLS + col] - '0';
             if (val != 0) {
                 cs++;
             }
         }
         game->my_checksum[row] = cs;
     }
-    return 0;
 }
 
-AttackedCellType check_game_status(MessageBuffer* msg, GameState* game){
-    int x = msg->buffer[8] - '0';    // row
-    int y = msg->buffer[10] - '0';   // column
+void attacking_opponent(GameState *game) {
+    uint8_t x;
+    uint8_t y;
+    uint8_t index;
 
-    if (msg->buffer[8] < '0' || msg->buffer[8] > '9' || msg->buffer[10] < '0' || msg->buffer[10] > '9') {
-        return ATTACK_ERROR;
-    }
-
-    if (game->my_field[CELL] == 0) {
-        if(game->enemy_shots[CELL] != 'M') {
-            game->enemy_shots[CELL] = 'M';
-        }
-
-        return MISS;
-    } else {
-        if(game->enemy_shots[CELL] != 'H') {
-            game->enemy_shots[CELL] = 'H';
-            game->enemy_hits++;
-        }
-        
-        if (game->enemy_hits == 30) {
-            return LOST;
-        } else {
-            return HIT;
-        }
-    }
-}
-
-int attacking_opponent(GameState *game) {
-    int x;
-    int y;
     do {
-        x = rand() % 10;           // Zeile 0–9
-        y = rand() % 10;           // Spalte 0–9
-    } while (game->my_shots[CELL] == 'H' || game->my_shots[CELL] == 'M');
+        x = rand() % 10;
+        y = rand() % 10;
+        index = IDX(x, y);
+    } while (game->my_shots[index] == 'H' || game->my_shots[index] == 'M');
+
     LOG("DH_BOOM_%d_%d\r\n", x, y);
+    
     game->last_shot_x = x;
     game->last_shot_y = y;
+}
 
-    return 0;
+bool validate_enemy_cs(GameState* game) {
+    uint8_t temp_enemy_cs[ROWS];
+
+    for (uint8_t row = 0; row < ROWS; row++) {
+        uint8_t cs = 0;
+        for (uint8_t col = 0; col < COLS; col++) {
+            uint8_t val = game->enemy_field[row * COLS + col] - '0';
+            if (val != 0) {
+                cs++;
+            }
+        }
+        temp_enemy_cs[row] = cs;
+    }
+    
+    for (uint8_t i = 0; i < ROWS; i++) {
+        if (temp_enemy_cs[i] != game->enemy_checksum[i]) {
+            return false;
+        }
+    }
+
+    return true;
 }
