@@ -109,6 +109,11 @@ typedef enum {
     /* MSG_INVALID */
 } MessageType;
 
+typedef enum {
+    HIT,
+    MISS
+} ShotType;
+
 typedef struct {
     char my_field[FIELD_SIZE];
     char enemy_field[FIELD_SIZE];
@@ -119,6 +124,7 @@ typedef struct {
     uint8_t enemy_hits;
     uint8_t last_shot_x;
     uint8_t last_shot_y;
+    ShotType last_shot_result;
     uint8_t parser_x;
     uint8_t parser_y;
     uint8_t parser_row;
@@ -126,15 +132,17 @@ typedef struct {
     bool i_lost;
 } GameState;
 
+int cheat_counter = 0;
+
 // =========================================================================
 // SECTION: State Machine Setup
 // =========================================================================
 
-void state_init(MessageBuffer* msg, GameState* game);
-void state_play(MessageBuffer* msg, GameState* game);
-void state_end(MessageBuffer* msg, GameState* game);
+void state_init(MessageBuffer*, GameState*);
+void state_play(MessageBuffer*, GameState*);
+void state_end(MessageBuffer*, GameState*);
 
-void init_new_game(MessageBuffer* msg, GameState* game);
+void init_new_game(MessageBuffer*, GameState*);
 
 typedef enum {STATE_INIT, STATE_PLAY, STATE_END} State_Type;
 typedef void (*StateFunction)(MessageBuffer*, GameState*);
@@ -149,21 +157,22 @@ static State_Type curr_state;
 // SECTION: Function Prototypes
 // =========================================================================
 
-/* Parser */
-void fifo_parser(MessageBuffer* msg);
-MessageType message_parser(MessageBuffer* msg, GameState* game);
+/* Parser and Decoder*/
+void fifo_parser(MessageBuffer*);
+MessageType message_decoder(MessageBuffer*, GameState*);
 
 /* Message Handlers */
-void handle_hd_start(GameState* game);
-void handle_hd_cs(MessageBuffer* msg, GameState* game);
-void handle_hd_boom_xy(GameState* game);
-void handle_hd_boom_result(MessageBuffer* msg, GameState* game);
-void handle_hd_sf_row(MessageBuffer* msg, GameState* game);
+void handle_hd_start(GameState*);
+void handle_hd_cs(GameState*);
+void handle_hd_boom_xy(GameState*);
+void handle_hd_boom_result(GameState*);
+void handle_hd_sf_row(MessageBuffer*, GameState*);
 
 /* Game Logic */
-void create_my_field(GameState* game);
-void attacking_opponent(GameState* game);
-bool validate_enemy_cs(GameState* game);
+void create_my_field(GameState*);
+void attacking_opponent(GameState*);
+bool validate_enemy_cs(GameState*);
+void print_my_field(GameState*);
 
 // =========================================================================
 // SECTION: Main()
@@ -243,13 +252,13 @@ void fifo_parser(MessageBuffer* msg)
             if (index < BUFFER_SIZE - 1) {
                 temp_msg_buffer[index++] = byte;
             } else {
-                index = 0; // Overflow
+                index = 0;  // Overflow
             }
         }
     }
 }
 
-MessageType message_parser(MessageBuffer* msg, GameState* game) 
+MessageType message_decoder(MessageBuffer* msg, GameState* game) 
 {
     /* HD_START */
     if (strcmp(msg->buffer, "HD_START") == 0) {
@@ -278,15 +287,28 @@ MessageType message_parser(MessageBuffer* msg, GameState* game)
     /* HD_BOOM_{H/M} */
     if (strncmp(msg->buffer, "HD_BOOM_", 8) == 0 && strlen(msg->buffer) == 9 &&
         (msg->buffer[8] == 'H' || msg->buffer[8] == 'M')) {
+        if (msg->buffer[8] == "H") {
+            game->last_shot_result = HIT;
+        } else {
+            game->last_shot_result = MISS;
+        }
         return MSG_HD_BOOM_RESULT;
     }
 
-    if (strncmp(msg->buffer, "HD_SF_", 6) == 0 &&
-        msg->buffer[6] >= '0' && msg->buffer[6] <= '9' &&
-        msg->buffer[7] == 'D' && strlen(msg->buffer) == 18) {
-
-        game->parser_row = msg->buffer[6] - '0';
+    /* HD_SF{Row}D{xxxxxxxxxx} */
+    if (strncmp(msg->buffer, "HD_SF", 5) == 0) {
+        game->parser_row = msg->buffer[5] - '0';
         return MSG_HD_SF_ROW;
+    }
+
+    /* additional task */
+    if (strcmp(msg->buffer, "DD_EVALUATE_CC") == 0) {
+        LOG("HOST cheated %d times!\r\n", cheat_counter);
+    }
+
+    if (strcmp(msg->buffer, "DD_RESET_CC") == 0) {
+        cheat_counter = 0;
+        LOG("Reset of Cheat-Counter was successfull!\r\n");
     }
 
     /* return MSG_INVALID; */
@@ -299,13 +321,13 @@ MessageType message_parser(MessageBuffer* msg, GameState* game)
 void state_init (MessageBuffer* msg, GameState* game) {
     if (!msg->ready) return;
     
-    MessageType type = message_parser(msg, game);
+    MessageType type = message_decoder(msg, game);
 
     if (type == MSG_HD_START) {
         handle_hd_start(game);
         curr_state = STATE_INIT; 
     } else if (type == MSG_HD_CS) {
-        handle_hd_cs(msg, game);
+        handle_hd_cs(game);
         curr_state = STATE_PLAY;
     }
 
@@ -315,7 +337,7 @@ void state_init (MessageBuffer* msg, GameState* game) {
 void state_play(MessageBuffer* msg, GameState* game) {
     if (!msg->ready) return;
 
-    MessageType type = message_parser(msg, game);
+    MessageType type = message_decoder(msg, game);
 
     if (type == MSG_HD_BOOM_XY) {
         handle_hd_boom_xy(game);
@@ -325,10 +347,10 @@ void state_play(MessageBuffer* msg, GameState* game) {
             curr_state = STATE_PLAY;
         }
     } else if (type == MSG_HD_BOOM_RESULT) {
-        handle_hd_boom_result(game, msg);
+        handle_hd_boom_result(game);
         curr_state = STATE_PLAY;
     } else if (type == MSG_HD_SF_ROW) {
-        handle_hd_sf_row(game, msg);
+        handle_hd_sf_row(msg, game);
         if (game->last_row) {
             curr_state = STATE_END;
         } else {
@@ -343,29 +365,24 @@ void state_end(MessageBuffer* msg, GameState* game) {
     if (game->i_lost) {
         if (!msg->ready) return;
 
-        MessageType type = message_parser(msg, game);
+        MessageType type = message_decoder(msg, game);
 
         if (type == MSG_HD_SF_ROW) {
-            handle_hd_sf_row(game, msg);
+            handle_hd_sf_row(msg, game);
 
             if (game->last_row) {
                 if (validate_enemy_cs(game)) {
-                    init_new_game(msg, game);
-                    curr_state = STATE_INIT;
+                    /* handle Cheating here */
+                    cheat_counter++;
                 }
+                init_new_game(msg, game);
+                curr_state = STATE_INIT;
             }
         }
 
         msg->ready = false;
     } else {
-        for (uint8_t row = 0; row < 10; row++) {
-            LOG("DH_SF%dD", row);
-            for (uint8_t col = 0; col < 10; col++) {
-                LOG("%c", game->my_field[IDX(row, col)]);
-            }
-            LOG("\r\n");
-        }
-
+        print_my_field(game);
         init_new_game(msg, game);
         curr_state = STATE_INIT;
     }
@@ -406,11 +423,8 @@ void handle_hd_start(GameState* game) {
     create_my_field(game);
 }
 
-void handle_hd_cs(MessageBuffer* msg, GameState* game) {
-    for (uint8_t i = 0; i < ROWS; i++) {
-        game->enemy_checksum[i] = msg->buffer[i + 6] - '0';
-    }
-    
+void handle_hd_cs(GameState* game) {
+    // Checksum already saved in message_decoder    
     LOG("DH_CS_");
     for (int i = 0; i < 10; i++) {
         LOG("%d", game->my_checksum[i]);
@@ -436,13 +450,7 @@ void handle_hd_boom_xy(GameState* game) {
         
         if (game->enemy_hits == 30) {
             game->i_lost = true;
-            for (uint8_t row = 0; row < 10; row++) {
-                LOG("DH_SF%dD", row);
-                for (uint8_t col = 0; col < 10; col++) {
-                    LOG("%c", game->my_field[IDX(row, col)]);
-                }
-                LOG("\r\n");
-            }
+            print_my_field(game);
 
             return;
         }
@@ -453,14 +461,14 @@ void handle_hd_boom_xy(GameState* game) {
     attacking_opponent(game);
 }
 
-void handle_hd_boom_result(MessageBuffer* msg, GameState* game) {
+void handle_hd_boom_result(GameState* game) {
     uint8_t x = game->last_shot_x;
     uint8_t y = game->last_shot_y;
     uint8_t index = IDX(x, y);
 
-    if(msg->buffer[8] == 'H') {
+    if(game->last_shot_result == HIT) {
         game->my_shots[index] = 'H';
-    } else if (msg->buffer[8] == 'M') {
+    } else if (game->last_shot_result == MISS) {
         game->my_shots[index] = 'M';
     }
 }
@@ -510,6 +518,16 @@ void create_my_field(GameState* game) {
     }
 }
 
+void print_my_field(GameState* game) {
+    for (uint8_t row = 0; row < 10; row++) {
+            LOG("DH_SF%dD", row);
+            for (uint8_t col = 0; col < 10; col++) {
+                LOG("%c", game->my_field[IDX(row, col)]);
+            }
+            LOG("\r\n");
+    }
+}
+
 void attacking_opponent(GameState *game) {
     uint8_t x;
     uint8_t y;
@@ -533,7 +551,7 @@ bool validate_enemy_cs(GameState* game) {
     for (uint8_t row = 0; row < ROWS; row++) {
         uint8_t cs = 0;
         for (uint8_t col = 0; col < COLS; col++) {
-            uint8_t val = game->enemy_field[row * COLS + col] - '0';
+            uint8_t val = game->enemy_field[row * 10 + col] - '0';
             if (val != 0) {
                 cs++;
             }
